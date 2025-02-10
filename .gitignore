@@ -14,3 +14,8 @@ split_files/
 
 # Outputs.
 results_*/
+
+# compiled
+build
+dist
+*.egg-info

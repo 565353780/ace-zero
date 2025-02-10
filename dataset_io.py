@@ -1,11 +1,16 @@
-import glob
-import numpy as np
-import torch
-from scipy.spatial.transform import Rotation
-import logging
-import torchvision.transforms.functional as TF
+import sys
+sys.path.append('./ace_zero/Lib/ZoeDepth/')
 
-_logger = logging.getLogger(__name__)
+import glob
+import torch
+import numpy as np
+import torchvision.transforms.functional as TF
+from scipy.spatial.transform import Rotation
+
+from zoedepth.models.zoedepth_nk import ZoeDepthNK
+
+from zoedepth.models.builder import build_model
+from zoedepth.utils.config import get_config
 
 
 def load_pose(pose_file):
@@ -195,19 +200,16 @@ def get_depth_model(init=False):
     """
 
     # Warm up dependency in the torch hub cache.
-    torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
-    repo = "isl-org/ZoeDepth"
+    # torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
 
-    # # Zoe_N
-    # model_zoe_n = torch.hub.load(repo, "ZoeD_N", pretrained=True, force_reload=init, trust_repo="check")
+    conf = get_config("zoedepth_nk", "infer")
+    # model_zoe_nk = build_model(conf)
+    model_zoe_nk = ZoeDepthNK.build_from_config(conf)
 
-    # # Zoe_K
-    # model_zoe_k = torch.hub.load(repo, "ZoeD_K", pretrained=True, force_reload=init, trust_repo="check")
-
-    # Zoe_NK (best performing model).
-    model_zoe_nk = torch.hub.load(repo, "ZoeD_NK", pretrained=True, force_reload=init, trust_repo="check")
-    model_zoe_nk.eval().cuda()
-    _logger.info(f"Loaded pretrained ZoeDepth model.")
+    model_file_path = '/home/chli/chLi/Model/ZoeDepth/ZoeD_M12_NK.pt'
+    state_dict = torch.load(model_file_path, map_location='cpu')
+    model_zoe_nk.load_state_dict(state_dict)
+    print(f"Loaded pretrained ZoeDepth model.")
 
     return model_zoe_nk
 
