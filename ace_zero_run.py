@@ -23,6 +23,8 @@ if __name__ == '__main__':
     del model
     print(f"Depth estimation model ready to use.")
 
+    reconstruction_start_time = time.time()
+
     if opt.seed_network is not None:
         print(f"Using pre-trained network as seed: {opt.seed_network}")
         iteration_id = opt.seed_network.stem
