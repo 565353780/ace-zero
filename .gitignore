@@ -19,3 +19,7 @@ results_*/
 build
 dist
 *.egg-info
+
+# output
+logs
+output
