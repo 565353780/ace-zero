@@ -202,13 +202,29 @@ def get_depth_model(init=False):
     # Warm up dependency in the torch hub cache.
     # torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
 
-    conf = get_config("zoedepth_nk", "infer")
-    # model_zoe_nk = build_model(conf)
-    model_zoe_nk = ZoeDepthNK.build_from_config(conf)
-
     model_file_path = '/home/chli/chLi/Model/ZoeDepth/ZoeD_M12_NK.pt'
-    state_dict = torch.load(model_file_path, map_location='cpu')
-    model_zoe_nk.load_state_dict(state_dict)
+    device = 'cuda'
+
+    conf = get_config("zoedepth_nk", "infer")
+
+    conf['midas_model_type'] = 'DPT_BEiT_L_512'
+    conf['pretrained_resource'] = None
+
+    # model_zoe_nk = build_model(conf)
+    model_zoe_nk = ZoeDepthNK.build_from_config(conf).to(device)
+
+    state_dict = torch.load(model_file_path, map_location='cpu')['model']
+
+    valid_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('core.core.pretrained.model'):
+            continue
+            new_key = key.replace('relative_position_index', 'relative_position_indices')
+            valid_state_dict[new_key] = value
+        else:
+            valid_state_dict[key] = value
+
+    model_zoe_nk.load_state_dict(valid_state_dict, strict=False)
     print(f"Loaded pretrained ZoeDepth model.")
 
     return model_zoe_nk
