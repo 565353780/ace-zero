@@ -49,8 +49,15 @@ After the eval runs, there will be an evaluation JSON in the output dir containi
 
 Where OUTPUT_DIR is whatever you passed via the `--output_dir` argument above.
 
+Some datasets (e.g. Scannet) have small black borders around the image. 
+This can negatively impact the benchmark results.
+The benchmark script supports a `--crop X` option that removes X pixels from each image side, and rescales the image.
+Note that the intrinsics will not be adjusted, so large values of X could cause problems. 
+In our experiments with Scannet, using `--crop 15` was fine.
+
 The images will be downscaled as necessary to a max side length of 640 pixels for NeRF training.
 This is because NeRF quality and training speed can degrade dramatically with high-resolution images.
+Cropping, if you use it, happens before downscaling.
 
 ## FAQs
 

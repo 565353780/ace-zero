@@ -338,20 +338,25 @@ class PointCloudBuffer:
         self.pc_xyz_buffer = []
         self.pc_clr_buffer = []
         self.pc_err_buffer = []
+        self.pc_depth_buffer = []
 
-    def update_buffer(self, pc_xyz, pc_clr, pc_errs=None):
+    def update_buffer(self, pc_xyz, pc_clr, pc_errs=None, pc_depth=None):
         """
         Add a new (partial) point cloud to the buffer.
 
         @param pc_xyz: N3, coordinates of points
         @param pc_clr: N3, RGB colors of points
         @param pc_errs: N1, scalar errors of points
+        @param pc_depth: N1, depth values of points
         """
         self.pc_xyz_buffer.append(pc_xyz)
         self.pc_clr_buffer.append(pc_clr)
 
         if pc_errs is not None:
             self.pc_err_buffer.append(pc_errs)
+
+        if pc_depth is not None:
+            self.pc_depth_buffer.append(pc_depth)
 
         # remove oldest xyz and clr entries in the buffer if buffer is full
         if 0 < self.pc_buffer_size < len(self.pc_xyz_buffer):
@@ -361,6 +366,9 @@ class PointCloudBuffer:
         # errs handled separately, because optional
         if 0 < self.pc_buffer_size < len(self.pc_err_buffer):
             self.pc_err_buffer = self.pc_err_buffer[1:]
+
+        if 0 < self.pc_buffer_size < len(self.pc_depth_buffer):
+            self.pc_depth_buffer = self.pc_depth_buffer[1:]
 
     def get_point_cloud(self):
         """
@@ -377,7 +385,12 @@ class PointCloudBuffer:
         else:
             merged_errs = None
 
-        return merged_xyz, merged_clr, merged_errs
+        if len(self.pc_depth_buffer) > 0:
+            merged_depth = np.concatenate(self.pc_depth_buffer)
+        else:
+            merged_depth = None
+
+        return merged_xyz, merged_clr, merged_errs, merged_depth
 
     def disable_buffer_cap(self):
         """

@@ -154,7 +154,7 @@ if __name__ == '__main__':
                 images = [f for f in files if f.endswith('color.png')]
                 for img in images:
                     os.system(
-                        'ln -s ../../../' + src_folder + '/' + ds + '/' + seq + '/' + img + ' ' + target_folder + variant + '/rgb/' + seq + '-' + img)
+                        'ln -s ../../../../' + src_folder + '/' + ds + '/' + seq + '/' + img + ' ' + target_folder + variant + '/rgb/' + seq + '-' + img)
 
                 pose_files = [f for f in files if f.endswith('pose.txt')]
 
@@ -164,7 +164,7 @@ if __name__ == '__main__':
                     # link original poses
                     for p_file in pose_files:
                         os.system(
-                            'ln -s ../../../' + src_folder + '/' + ds + '/' + seq + '/' + p_file + ' ' + target_folder + variant + '/poses/' + seq + '-' + p_file)
+                            'ln -s ../../../../' + src_folder + '/' + ds + '/' + seq + '/' + p_file + ' ' + target_folder + variant + '/poses/' + seq + '-' + p_file)
 
                 elif opt.poses == 'pgt':
 

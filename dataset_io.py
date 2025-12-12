@@ -1,16 +1,13 @@
-import sys
-sys.path.append('./ace_zero/Lib/ZoeDepth/')
-
 import glob
-import torch
+from pathlib import Path
+
 import numpy as np
-import torchvision.transforms.functional as TF
+import torch
 from scipy.spatial.transform import Rotation
+import logging
+import torchvision.transforms.functional as TF
 
-from zoedepth.models.zoedepth_nk import ZoeDepthNK
-
-from zoedepth.models.builder import build_model
-from zoedepth.utils.config import get_config
+_logger = logging.getLogger(__name__)
 
 
 def load_pose(pose_file):
@@ -83,19 +80,26 @@ def remove_invalid_poses(rgb_files, poses):
     """
     Remove each invalid pose from poses and the corresponding RGB file from rgb_files.
     An invalid pose is a pose that contains NaN or inf values.
+    Also returns a list with len=len(rgb_files), indicating with True whether a pose was valid.
     """
+
+    if len(poses) == 0:
+        return rgb_files, [], [True]*len(rgb_files)
 
     valid_rgb_files = []
     valid_poses = []
+    files_kept = []
 
     for rgb_file, pose in zip(rgb_files, poses):
         if not check_pose(pose):
             _logger.warning(f"Pose for {rgb_file} contains NaN or inf values, skipping.")
+            files_kept.append(False)
         else:
             valid_rgb_files.append(rgb_file)
             valid_poses.append(pose)
+            files_kept.append(True)
 
-    return valid_rgb_files, valid_poses
+    return valid_rgb_files, valid_poses, files_kept
 
 
 def load_dataset_ace(pose_file, confidence_threshold):
@@ -113,10 +117,11 @@ def load_dataset_ace(pose_file, confidence_threshold):
 
     :param pose_file: The path to the pose file.
     :param confidence_threshold: The minimum confidence value for an entry to be included in the output.
-    :return: A tuple containing three lists:
+    :return: A tuple containing four lists:
         - rgb_files: The paths to the RGB files.
         - poses: The poses as 4x4 torch tensors, cam-to-world.
         - focal_lengths: The focal lengths.
+        - files_kept: An indicator list of length equivalent to all unfiltered entries, with True if confidence >= confidence_threshold.
     """
 
     with open(pose_file, 'r') as f:
@@ -125,17 +130,13 @@ def load_dataset_ace(pose_file, confidence_threshold):
         rgb_files = []
         poses = []
         focal_lengths = []
+        confidences = []
 
         for pose_file_entry in pose_file_data:
 
             pose_file_tokens = pose_file_entry.split()
 
             assert len(pose_file_tokens) == 10, f"Expected 10 tokens per line in pose file, got {len(pose_file_tokens)}"
-
-            # read confidence values and compare to threshold
-            confidence = float(pose_file_tokens[-1])
-            if confidence < confidence_threshold:
-                continue
 
             mapping_file = pose_file_tokens[0]
 
@@ -156,9 +157,19 @@ def load_dataset_ace(pose_file, confidence_threshold):
 
             rgb_files.append(mapping_file)
             focal_lengths.append(float(pose_file_tokens[-2]))
+            confidences.append(float(pose_file_tokens[-1]))
             poses.append(mapping_pose_4x4)
 
-    return rgb_files, poses, focal_lengths
+    # sort according to rgb file name
+    rgb_files, poses, focal_lengths, confidences = zip(*sorted(zip(rgb_files, poses, focal_lengths, confidences)))
+
+    # filter according to confidence
+    rgb_files = [rgb_file for rgb_file, confidence in zip(rgb_files, confidences) if confidence >= confidence_threshold]
+    poses = [pose for pose, confidence in zip(poses, confidences) if confidence >= confidence_threshold]
+    focal_lengths = [focal_length for focal_length, confidence in zip(focal_lengths, confidences) if confidence >= confidence_threshold]
+    files_kept = [confidence >= confidence_threshold for confidence in confidences]
+
+    return rgb_files, poses, focal_lengths, files_kept
 
 
 def write_pose_to_pose_file(out_pose_file, rgb_file, pose, confidence, focal_length):
@@ -184,7 +195,7 @@ def write_pose_to_pose_file(out_pose_file, rgb_file, pose, confidence, focal_len
     t_xyz = pose[:3, 3]
 
     # write to pose file
-    pose_str = f"{rgb_file} " \
+    pose_str = f"{Path(rgb_file)} " \
                f"{q_xyzw[3]} {q_xyzw[0]} {q_xyzw[1]} {q_xyzw[2]} " \
                f"{t_xyz[0]} {t_xyz[1]} {t_xyz[2]} {focal_length} {confidence}\n"
 
@@ -200,32 +211,19 @@ def get_depth_model(init=False):
     """
 
     # Warm up dependency in the torch hub cache.
-    # torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
+    torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
+    repo = "isl-org/ZoeDepth"
 
-    model_file_path = '/home/chli/chLi/Model/ZoeDepth/ZoeD_M12_NK.pt'
-    device = 'cuda'
+    # # Zoe_N
+    # model_zoe_n = torch.hub.load(repo, "ZoeD_N", pretrained=True, force_reload=init, trust_repo="check")
 
-    conf = get_config("zoedepth_nk", "infer")
+    # # Zoe_K
+    # model_zoe_k = torch.hub.load(repo, "ZoeD_K", pretrained=True, force_reload=init, trust_repo="check")
 
-    conf['midas_model_type'] = 'DPT_BEiT_L_512'
-    conf['pretrained_resource'] = None
-
-    # model_zoe_nk = build_model(conf)
-    model_zoe_nk = ZoeDepthNK.build_from_config(conf).to(device)
-
-    state_dict = torch.load(model_file_path, map_location='cpu')['model']
-
-    valid_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith('core.core.pretrained.model'):
-            continue
-            new_key = key.replace('relative_position_index', 'relative_position_indices')
-            valid_state_dict[new_key] = value
-        else:
-            valid_state_dict[key] = value
-
-    model_zoe_nk.load_state_dict(valid_state_dict, strict=False)
-    print(f"Loaded pretrained ZoeDepth model.")
+    # Zoe_NK (best performing model).
+    model_zoe_nk = torch.hub.load(repo, "ZoeD_NK", pretrained=True, force_reload=init, trust_repo="check")
+    model_zoe_nk.eval().cuda()
+    _logger.info(f"Loaded pretrained ZoeDepth model.")
 
     return model_zoe_nk
 

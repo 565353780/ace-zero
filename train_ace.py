@@ -22,7 +22,7 @@ if __name__ == '__main__':
         description='Fast training of a scene coordinate regression network.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('rgb_files', type=str, help="Glob pattern for RGB files, e.g. 'datasets/scene/*.jpg'")
+    parser.add_argument('rgb_files', type=str, help="Glob pattern for RGB files, e.g. 'datasets/scene/rgb/*.jpg'")
 
     parser.add_argument('output_map_file', type=Path,
                         help='target file for the trained network')
@@ -33,11 +33,18 @@ if __name__ == '__main__':
     # === Data definition ==============================================================================================
 
     parser.add_argument('--pose_files', type=str, default=None,
-                        help="Glob pattern for pose files, e.g. 'datasets/scene/*.txt', each file is assumed to "
+                        help="Glob pattern for pose files, e.g. 'datasets/scene/poses/*.txt', each file is assumed to "
                              "contain a 4x4 pose matrix, cam2world, correspondence with rgb files is assumed by "
                              "alphabetical order; None: provide poses via use_ace_pose_file or use_pose_seed")
 
-    parser.add_argument('--use_ace_pose_file',  type=Path, default=None,
+    parser.add_argument('--calibration_files', type=str, default=None,
+                        help='Glob pattern for calibration files, e.g. "datasets/scene/calibration/*.txt", from which '
+                             'the focal length is read.')
+
+    parser.add_argument('--calibration_file_f_idx', type=int, default=0,
+                        help='Index of the item in each calibration file to be interpreted as focal length.')
+
+    parser.add_argument('--use_ace_pose_file', type=Path, default=None,
                         help='ACE pose file containing mapping images to use, their poses and focal lengths;'
                              'None: provide poses via pose_files or use_pose_seed')
 
@@ -49,7 +56,7 @@ if __name__ == '__main__':
                              'float value [0-1] represents image ID relative to dataset size, -1: do not use seed')
 
     parser.add_argument('--depth_files', type=str, default=None,
-                        help="Glob pattern for depth files, e.g. 'datasets/scene/*.png', each file is assumed to "
+                        help="Glob pattern for depth files, e.g. 'datasets/scene/depth/*.png', each file is assumed to "
                              "contain depth in millimeters, correspondence with rgb files is assumed by "
                              "alphabetical order, None: Don't use depth.")
 
@@ -127,10 +134,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--samples_per_image', type=int, default=1024,
                         help='number of patches drawn from each image when creating the buffer')
-    
-    parser.add_argument('--training_buffer_cpu', type=_strtobool, default=False, 
+
+    parser.add_argument('--training_buffer_cpu', type=_strtobool, default=False,
                         help='store training buffer on CPU memory instead of GPU, '
-                        'this allows running ACE0 on smaller GPUs, but is slower')
+                             'this allows running ACE0 on smaller GPUs, but is slower')
 
     # === Optimization parameters ======================================================================================
 
@@ -170,6 +177,44 @@ if __name__ == '__main__':
     parser.add_argument('--depth_max', type=float, default=1000,
                         help='enforce maximum depth of network predictions')
 
+    # === Probabilistic loss parameters ====================================================================================
+
+    parser.add_argument("--loss_structure", type=str, default="dsac*", choices=["dsac*", "probabilistic"],
+                        help='General structure of the loss:'
+                             'dsac*: Switches between optimizing reprojection error or an initialization loss based on '
+                             'validity criteria of each scene coordinate. Introduced in the DSAC* paper (TPAMI21) and '
+                             'used in the original ACE0 paper (ECCV24).'
+                             'probabilistic: Optimizes reprojection error and a prior loss jointly. Introduced in the '
+                             'Scene Coordinate Reconstruction Priors paper (ICCV25).')
+
+    parser.add_argument('--prior_loss_type', type=str, default="none", choices=["none", "rgbd_laplace_nll", "laplace_nll", "laplace_wd", "diffusion"],
+                        help='prior to be used in the probabilistic formulation of the loss,'
+                             'rgbd_laplace_nll: negative log likelihood of reconstructed depth wrt a Laplace prior centered on measured depth (needs RGB-D inputs),'
+                             'laplace_nll: negative log likelihood of reconstructed depth wrt a user-defined Laplace prior,'
+                             'laplace_wd: wasserstein distance reconstructed depth distribution and user-defined Laplace prior,'
+                             'diffusion: point cloud diffusion model predicting the gradients of the ACE point cloud likelihood' )
+
+    parser.add_argument('--prior_loss_weight', type=float, default=1,
+                        help='weight for prior in the loss')
+
+    parser.add_argument('--prior_loss_bandwidth', type=float, default=0.1,
+                        help="Bandwidth of the prior Laplace distribution, in meters.")
+
+    parser.add_argument('--prior_loss_location', type=float, default=1,
+                        help="Location of the prior Laplace distribution, in meters. Not used for RGB-D priors.")
+
+    parser.add_argument('--prior_diffusion_model_path', type=Path, default=None,
+                        help='Path to a pretrained 3D point cloud diffusion model.')
+
+    parser.add_argument('--prior_diffusion_start_step', type=int, default=0,
+                        help='Start diffusion regularization after n iterations. ACE -> 5000, ACE0 -> 0')
+
+    parser.add_argument('--prior_diffusion_warmup_steps', type=int, default=-1,
+                        help='Linear increase of diffusion weight in first N iterations. ACE -> 1000, ACE0 -> -1 (disabled)')
+
+    parser.add_argument('--prior_diffusion_subsample', type=float, default=1.0,
+                        help='Sub-sample ratio for inputs to diffusion prior for large batch sizes. 1.0 = no subsampling, 0.1 = use 10% of samples')
+
     # === Data augmentation ============================================================================================
 
     parser.add_argument('--use_aug', type=_strtobool, default=True,
@@ -208,6 +253,9 @@ if __name__ == '__main__':
     parser.add_argument('--render_marker_size', type=float, default=0.03,
                         help='size of the camera frustums in the visualization')
 
+    parser.add_argument('--render_depth_hist', type=_strtobool, default=False,
+                        help="Show a histogram of reconstructed depth values throughout mapping iterations.")
+
     # === Pose refinement parameters ===================================================================================
 
     parser.add_argument('--pose_refinement', type=str, default='none', choices=['none', 'naive', 'mlp'],
@@ -233,9 +281,9 @@ if __name__ == '__main__':
         raise ValueError("Either use_pose_seed or use_ace_pose_file or pose_files has to be set.")
 
     if not options.use_heuristic_focal_length and options.use_external_focal_length is None \
-            and options.use_ace_pose_file is None:
+            and options.use_ace_pose_file is None and options.calibration_files is None:
         raise ValueError("Either use_heuristic_focal_length or use_external_focal_length "
-                         "or use_ace_pose_file has to be set.")
+                         "or use_ace_pose_file or calibration_files has to be set.")
 
     trainer = TrainerACE(options)
     trainer.train()

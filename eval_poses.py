@@ -36,8 +36,8 @@ if __name__ == '__main__':
                              "contain a 4x4 pose matrix, cam2world, correspondence with rgb files in the ACE pose "
                              "file is assumed by alphabetical order")
 
-    parser.add_argument('--estimate_alignment', type=_strtobool, default=True,
-                        help='Estimate rigid body transformation between estimates and ground truth.')
+    parser.add_argument('--estimate_alignment', type=str, default='ransac', choices=['ransac', 'least_squares', 'none'],
+                        help='Method for estimating rigid body transformation between estimates and ground truth.')
 
     parser.add_argument('--estimate_alignment_scale', type=_strtobool, default=True,
                         help='Estimate similarity transformation when estimating alignment')
@@ -50,6 +50,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--pose_error_thresh_r', type=float, default=5,
                         help='Pose threshold (rotation) for evaluation and alignment')
+
+    parser.add_argument('--reg_rate_conf_threshold', type=float, default=1000,
+                        help='Calculate the registration rate as the ratio of estimates with confidence larger than this.')
+
+    parser.add_argument('--results_file', type=str, default=None,
+                        help='Store evaluation stats in text file, in the same folder as the ACE pose file. None: No file is created.')
 
     opt = parser.parse_args()
 
@@ -107,7 +113,7 @@ if __name__ == '__main__':
     # Percentage of frames predicted within certain threshold from their GT pose.
     accuracy = 0
 
-    if opt.estimate_alignment:
+    if opt.estimate_alignment != 'none':
         # alignment needs a list of pose correspondences with confidences
         pose_correspondences = []
 
@@ -121,32 +127,61 @@ if __name__ == '__main__':
                 focal_length=None
             )))
 
-        alignment_transformation, alignment_scale = tutil.estimate_alignment(
-            estimates=pose_correspondences,
-            confidence_threshold=opt.estimate_alignment_conf_threshold,
-            estimate_scale=opt.estimate_alignment_scale,
-            inlier_threshold_r=opt.pose_error_thresh_r,
-            inlier_threshold_t=opt.pose_error_thresh_t,
-        )
+        # calculate the alignment, the transformation aligns estimated poses to GT
+        if opt.estimate_alignment == 'ransac':
+
+            alignment_transformation, alignment_scale = tutil.estimate_alignment_ransac(
+                estimates=pose_correspondences,
+                confidence_threshold=opt.estimate_alignment_conf_threshold,
+                estimate_scale=opt.estimate_alignment_scale,
+                inlier_threshold_r=opt.pose_error_thresh_r,
+                inlier_threshold_t=opt.pose_error_thresh_t,
+            )
+
+        elif opt.estimate_alignment == 'least_squares':
+
+            # calculate the alignment, the transformation aligns estimated poses to GT
+            alignment_transformation, alignment_scale = tutil.estimate_alignment_least_squares(
+                estimates=pose_correspondences,
+                confidence_threshold=opt.estimate_alignment_conf_threshold,
+                estimate_scale=opt.estimate_alignment_scale
+            )
+        else:
+            raise ValueError(f"Unknown alignment method {opt.estimate_alignment}")
 
         if alignment_transformation is None:
             _logger.info(f"Alignment requested but failed. Setting all pose errors to {math.inf}.")
+
     else:
         alignment_transformation = np.eye(4)
         alignment_scale = 1.
 
     # Evaluation Loop
+    gt_poses = []
+    pred_poses_aligned = []
+
     for (ace_pose, ace_confidence), gt_pose in zip(sorted_ace_poses, sorted_gt_poses):
 
+        # Check if the GT pose is valid.
+        if np.isinf(gt_pose).any() or np.isnan(gt_pose).any():
+            _logger.info(f"Skipping invalid GT pose.")
+            continue
+
         if alignment_transformation is not None:
-            # Apply alignment transformation to GT pose
-            gt_pose = alignment_transformation @ gt_pose
+            # Apply alignment transformation to predicted pose (alignment is gt to predicted, so we need the inverse)
+            alignment_transformation_inv = np.linalg.inv(alignment_transformation)
+            ace_pose = alignment_transformation_inv @ ace_pose
+            # Scale correction to rotation component (to make it orthonormal again):
+            # Alignment is a similarity transform which includes scaling.
+            # This cannot be applied to rotations without correction.
+            ace_pose[:3, :3] *= alignment_scale
+
+            # Store for ATE and RPE computation
+            gt_poses.append(gt_pose)
+            pred_poses_aligned.append(ace_pose)
 
             # Calculate translation error.
             t_err = float(np.linalg.norm(gt_pose[0:3, 3] - ace_pose[0:3, 3]))
-
-            # Correct translation scale with the inverse alignment scale (since we align GT with estimates)
-            t_err = t_err / alignment_scale
 
             # Rotation error.
             gt_R = gt_pose[0:3, 0:3]
@@ -172,7 +207,13 @@ if __name__ == '__main__':
             accuracy += 1
 
     total_frames = len(rErrs)
-    assert total_frames == len(ace_estimates)
+
+    gt_poses = np.array(gt_poses)
+    pred_poses_aligned = np.array(pred_poses_aligned)
+
+    # Compute ATE and RPE.
+    ate = tutil.compute_ATE(gt_poses, pred_poses_aligned) * 100 # in cm
+    rpe = tutil.compute_RPE(gt_poses, pred_poses_aligned) * 100 # in cm
 
     # Compute median errors.
     tErrs.sort()
@@ -182,10 +223,26 @@ if __name__ == '__main__':
     median_tErr = tErrs[median_idx]
 
     # Compute final precision.
-    accuracy = accuracy / total_frames * 100
+    accuracy = accuracy / total_frames * 100 # in %
+
+    # Compute registration rate
+    reg_rate = sum([conf >= opt.reg_rate_conf_threshold for _, conf in sorted_ace_poses]) / len(sorted_ace_poses) * 100 # in %
 
     _logger.info("===================================================")
-    _logger.info("Test complete.")
 
-    _logger.info(f'Accuracy: {accuracy:.1f}%')
+    _logger.info(f"Registration Rate (@{opt.reg_rate_conf_threshold} conf): {reg_rate:.1f}%")
+    _logger.info(f'Accuracy (@{opt.pose_error_thresh_t}m/{opt.pose_error_thresh_r}°): {accuracy:.1f}%')
     _logger.info(f"Median Error: {median_rErr:.1f}deg, {median_tErr:.1f}cm")
+
+    if opt.estimate_alignment != 'least_squares':
+        _logger.warning(f"ATE/RPE stats have been computed with alignment: {opt.estimate_alignment}, usually: least_squares.")
+    _logger.info(f"ATE: {ate:.1f}cm, RPE: {rpe:.1f}cm")
+
+    if opt.results_file is not None:
+        # Save results to txt.
+        with open(opt.ace_pose_file.parent / opt.results_file, 'w') as f:
+            f.write(f'RegistrationRate(@{opt.reg_rate_conf_threshold}conf) Accuracy(@{opt.pose_error_thresh_t}m/{opt.pose_error_thresh_r}°) MedianRot(°) MedianTrans(cm) ATE(cm) RPE(cm)\n')
+            f.write(f'{reg_rate:.2f} {accuracy:.2f} {median_rErr:.2f} {median_tErr:.2f} {ate:.2f} {rpe:.2f}\n')
+        _logger.info(f"Results written to {opt.ace_pose_file.parent / opt.results_file}")
+
+    _logger.info("Test complete.")

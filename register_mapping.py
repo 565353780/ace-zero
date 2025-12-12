@@ -110,6 +110,13 @@ if __name__ == '__main__':
                         help="Provide the focal length of images. Can be refined. "
                              "-1: Use 70% of image diagonal as guess.")
 
+    parser.add_argument('--calibration_files', type=str, default=None,
+                        help='Glob pattern for calibration files, e.g. "datasets/scene/calibration/*.txt", from which '
+                             'the focal length is read.')
+
+    parser.add_argument('--calibration_file_f_idx', type=int, default=0,
+                        help='Index of the item in each calibration file to be interpreted as focal length.')
+
     parser.add_argument('--render_marker_size', type=float, default=0.03,
                         help='size of the camera frustums in the visualization')
 
@@ -135,6 +142,8 @@ if __name__ == '__main__':
         rgb_files=opt.rgb_files,
         image_short_size=opt.image_resolution,
         use_heuristic_focal_length=use_heuristic_focal_length,
+        calibration_files=opt.calibration_files,
+        calibration_file_f_idx=opt.calibration_file_f_idx,
     )
     _logger.info(f'Test images found: {len(testset)}')
 

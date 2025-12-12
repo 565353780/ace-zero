@@ -60,36 +60,30 @@ def get_render_path(out_dir):
     return out_dir / "renderings"
 
 
-def get_refit_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
-    """
-    Constructs the mapping command for the last refinement iteration with a given scene and iteration.
-
-    Args:
-        rgb_files (str): Glob pattern to match RGB input files.
-        iteration_id (str): The ID of the current iteration.
-        out_dir (Path): The directory where the output will be stored.
-        opt (Namespace): An argparse.Namespace object containing various options for the mapping process.
-
-    Returns:
-        list: The base mapping command as a list of strings.
-    """
-
-    # specify base mapping call with exe, dataset and output map file
+def _get_common_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
+    """Constructs the common base for a mapping command."""
+    # Specify base mapping call with exe, dataset, and output map file
     mapping_cmd = [
         TRAINING_EXE,
         rgb_files,
         out_dir / f"{iteration_id}.pt",
     ]
 
-    # add general parameters to mapping command
+    # Add parameters common to all mapping commands
     mapping_cmd += [
-        "--repro_loss_type", "dyntanh",
+        "--loss_structure", opt.loss_structure,
+        "--prior_loss_type", opt.prior_loss_type,
+        "--prior_loss_weight", opt.prior_loss_weight,
+        "--prior_loss_bandwidth", opt.prior_loss_bandwidth,
+        "--prior_loss_location", opt.prior_loss_location,
+        "--prior_diffusion_start_step", opt.prior_diffusion_start_step,
+        "--prior_diffusion_warmup_steps", opt.prior_diffusion_warmup_steps,
+        "--prior_diffusion_subsample", opt.prior_diffusion_subsample,
         "--render_target_path", get_render_path(out_dir),
         "--render_marker_size", opt.render_marker_size,
         "--refinement_ortho", opt.refinement_ortho,
         "--ace_pose_file_conf_threshold", opt.registration_confidence,
         "--render_flipped_portrait", opt.render_flipped_portrait,
-        "--pose_refinement_wait", opt.final_refit_posewait,
         "--image_resolution", opt.image_resolution,
         "--pose_refinement_lr", opt.pose_refinement_lr,
         "--num_head_blocks", opt.num_head_blocks,
@@ -97,13 +91,38 @@ def get_refit_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
         "--repro_loss_soft_clamp", opt.repro_loss_soft_clamp,
         "--iterations_output", opt.iterations_output,
         "--max_dataset_passes", opt.max_dataset_passes,
-        "--learning_rate_schedule", "circle",
-        "--learning_rate_max", 0.005,
         "--learning_rate_cooldown_iterations", opt.cooldown_iterations,
         "--learning_rate_cooldown_trigger_percent_threshold", opt.cooldown_threshold,
         "--aug_rotation", opt.aug_rotation,
-        "--iterations", opt.refit_iterations,
         "--training_buffer_cpu", opt.training_buffer_cpu,
+        "--render_depth_hist", opt.render_depth_hist,
+    ]
+
+    if opt.prior_diffusion_model_path is not None:
+        mapping_cmd += ["--prior_diffusion_model_path", opt.prior_diffusion_model_path]
+
+    return mapping_cmd
+
+
+def get_refit_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
+    """
+    Constructs the mapping command for the last refinement iteration with a given scene and iteration.
+    """
+    # Start with the common set of options
+    mapping_cmd = _get_common_mapping_cmd(rgb_files, iteration_id, out_dir, opt)
+
+    # Determine the repro_loss_type, with a special case for the "dsac*" loss structure
+    repro_loss_type = opt.repro_loss_type
+    if opt.loss_structure == "dsac*":
+        repro_loss_type = "dyntanh"
+
+    # Add options specific to the refit command
+    mapping_cmd += [
+        "--repro_loss_type", repro_loss_type,
+        "--pose_refinement_wait", opt.final_refit_posewait,
+        "--learning_rate_schedule", "circle",
+        "--learning_rate_max", 0.005,
+        "--iterations", opt.refit_iterations,
     ]
 
     return mapping_cmd
@@ -112,46 +131,16 @@ def get_refit_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
 def get_base_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
     """
     Constructs the base mapping command for a given scene and iteration.
-
-    Args:
-        rgb_files (str): Glob pattern to match RGB input files.
-        iteration_id (str): The ID of the current iteration.
-        out_dir (Path): The directory where the output will be stored.
-        opt (Namespace): An argparse.Namespace object containing various options for the mapping process.
-
-    Returns:
-        list: The base mapping command as a list of strings.
     """
+    # Start with the common set of options
+    mapping_cmd = _get_common_mapping_cmd(rgb_files, iteration_id, out_dir, opt)
 
-    # specify base mapping call with exe, dataset and output map file
-    mapping_cmd = [
-        TRAINING_EXE,
-        rgb_files,
-        out_dir / f"{iteration_id}.pt",
-    ]
-
-    # add general parameters to mapping command
+    # Add options specific to the base mapping command
     mapping_cmd += [
         "--repro_loss_type", opt.repro_loss_type,
-        "--render_target_path", get_render_path(out_dir),
-        "--render_marker_size", opt.render_marker_size,
-        "--refinement_ortho", opt.refinement_ortho,
-        "--ace_pose_file_conf_threshold", opt.registration_confidence,
-        "--render_flipped_portrait", opt.render_flipped_portrait,
         "--pose_refinement_wait", opt.pose_refinement_wait,
-        "--image_resolution", opt.image_resolution,
-        "--pose_refinement_lr", opt.pose_refinement_lr,
-        "--num_head_blocks", opt.num_head_blocks,
-        "--repro_loss_hard_clamp", opt.repro_loss_hard_clamp,
-        "--repro_loss_soft_clamp", opt.repro_loss_soft_clamp,
-        "--iterations_output", opt.iterations_output,
-        "--max_dataset_passes", opt.max_dataset_passes,
         "--learning_rate_schedule", opt.learning_rate_schedule,
         "--learning_rate_max", opt.learning_rate_max,
-        "--learning_rate_cooldown_iterations", opt.cooldown_iterations,
-        "--learning_rate_cooldown_trigger_percent_threshold", opt.cooldown_threshold,
-        "--aug_rotation", opt.aug_rotation,
-        "--training_buffer_cpu", opt.training_buffer_cpu,
     ]
 
     return mapping_cmd

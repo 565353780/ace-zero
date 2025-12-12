@@ -104,7 +104,7 @@ if __name__ == '__main__':
     pose_dict = get_pose_iteration_dict(pose_file, iteration, confidence_threshold=pose_file_conf_threshold)
 
     # load poses
-    rgb_files, poses, _ = dataset_io.load_dataset_ace(pose_file, pose_file_conf_threshold)
+    rgb_files, poses, _, _ = dataset_io.load_dataset_ace(pose_file, pose_file_conf_threshold)
     poses = [pose.numpy() for pose in poses]
     pose_iterations = [pose_dict[rgb_file] for rgb_file in rgb_files]
 

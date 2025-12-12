@@ -10,7 +10,7 @@ from benchmarks.run_nerfstudio import eval_nerf_with_nerfstudio, fit_nerf_with_n
 def run_benchmark(pose_file: Path, images_glob_pattern: str, working_dir: Path, split_json: Optional[Path] = None,
                   dry_run: bool = False, ns_train_extra_args: Optional[Dict] = None,
                   downscale_factor_override: Optional[int] = None, method: str = 'nerfacto',
-                  max_resolution: int = 640, camera_optimizer: str = 'off') -> Optional[Path]:
+                  max_resolution: int = 640, camera_optimizer: str = 'off', crop: int = 0) -> Optional[Path]:
     """
     Top-level function to benchmark poses by fitting a NeRF.
 
@@ -25,6 +25,7 @@ def run_benchmark(pose_file: Path, images_glob_pattern: str, working_dir: Path, 
     :param method: The method to use for fitting the NeRF
     :param max_resolution: The maximum resolution to use for images
     :param camera_optimizer: The camera optimizer mode to use
+    :param crop: Crop this many pixels at each side of the image, e.g. to remove a black border
 
     :return: Path to the eval json containing metrics such as PSNR. Will be None iff dry_run is True.
     """
@@ -66,7 +67,7 @@ def run_benchmark(pose_file: Path, images_glob_pattern: str, working_dir: Path, 
     else:
         downscale_factor = downscale_factor_override
     if downscale_factor > 1:
-        downscale_images(nerf_data_path=nerf_data_path, downscale_factor=downscale_factor)
+        downscale_images(nerf_data_path=nerf_data_path, downscale_factor=downscale_factor, crop=crop)
 
     # Ensure paths in transforms json are absolute
     resolve_relative_paths_in_transforms_json(transforms_json_path=nerf_data_path / 'transforms.json')
@@ -185,7 +186,7 @@ def resolve_relative_paths_in_transforms_json(transforms_json_path: Path) -> Non
         json.dump(transforms_json, f, indent=4)
 
 
-def downscale_images(nerf_data_path: Path, downscale_factor: int) -> None:
+def downscale_images(nerf_data_path: Path, downscale_factor: int, crop: int) -> None:
     # Edge case: if downscale_factor is 1, then we don't need to do anything
     if downscale_factor == 1:
         print('Not downscaling images!')
@@ -210,9 +211,35 @@ def downscale_images(nerf_data_path: Path, downscale_factor: int) -> None:
     # Downscale all images; they could be either jpg or png
     for frame in transforms_json['frames']:
         file_path = Path(frame['file_path'])
-        print('Downscaling', file_path)
-        image = Image.open(file_path)
-        image = image.resize((image.width // downscale_factor, image.height // downscale_factor))
+        if crop > 0:
+            print('Downscaling and cropping', file_path)
+
+            image = Image.open(file_path)
+
+            original_width, original_height = image.size  # store original sizes.
+
+            # Calculate the cropped dimensions
+            cropped_width = original_width - 2 * crop
+            cropped_height = original_height - 2 * crop
+
+            # Crop the image
+            if cropped_width > 0 and cropped_height > 0:
+                image = image.crop(
+                    (crop, crop, original_width - crop, original_height - crop))
+            else:
+                print(f"Warning: Crop pixels too large for image size {original_width}x{original_height}")
+                return
+
+            # Calculate the target dimensions based on the ORIGINAL image size
+            target_width = original_width // downscale_factor
+            target_height = original_height // downscale_factor
+
+            # Resize the cropped image
+            image = image.resize((target_width, target_height))
+        else:
+            print('Downscaling', file_path)
+            image = Image.open(file_path)
+            image = image.resize((image.width // downscale_factor, image.height // downscale_factor))
 
         # Nerfstudio requires a flattened filestructure if we are using downscaling.
         # But if we naively do that then images with the same names in different subdirs clobber each other

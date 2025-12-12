@@ -25,6 +25,10 @@ if __name__ == '__main__':
                         help='Type of camera optimizer to use, might improve quality but break the benchmark')
     parser.add_argument('--max_resolution', type=int, default=640,
                         help='Maximum resolution of the images to use for the benchmark')
+    parser.add_argument('--crop', type=int, default=0,
+                        help='Crop this many pixels from each side (e.g. to remove a black border).'
+                             'The image will be rescaled without adjusting the focal length, '
+                             'so large values can lead to inaccuracies.')
     args = parser.parse_args()
 
     run_benchmark(
@@ -35,5 +39,6 @@ if __name__ == '__main__':
         dry_run=args.no_run_nerfstudio,
         method=args.method,
         max_resolution=args.max_resolution,
-        camera_optimizer=args.camera_optimizer
+        camera_optimizer=args.camera_optimizer,
+        crop=args.crop
     )

@@ -21,7 +21,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data import sampler
 
 from ace_util import get_pixel_grid, to_homogeneous
-from ace_loss import ReproLoss
+from ace_loss import AceLoss
+from ace_repro_loss import ReproLoss
+from ace_prior_loss import PriorLoss
 from ace_network import Regressor
 from ace_schedule import ScheduleACE
 from refine_calibration import CalibrationRefiner
@@ -87,8 +89,20 @@ class TrainerACE:
         # Number of workers for data loading.
         self.num_data_loader_workers = self.options.num_data_workers
 
-        # Determine whether we will generate ground truth scene coordinate from depth maps.
+        # Determine whether we will generate target coordinates from depth maps.
         self.use_depth = (self.options.use_pose_seed >= 0) or (self.options.depth_files is not None)
+
+        # DSAC* type loss requires the dataset to return scene coordinate targets,
+        # probabilistic loss require camera coordinates
+        return_eye_coords = (self.options.loss_structure == "probabilistic")
+
+        # when mapping the seed images with a probabilistic loss, we always have to use an RGB-D prior
+        if self.options.loss_structure == "probabilistic" and self.options.use_pose_seed >= 0:
+            _logger.info("Note: When mapping seed images with probabilistic losses, "
+                         "we fall back to an RGB-D Laplace prior with bandwidth 0.1m and weight 1.")
+            self.options.prior_loss_type = "rgbd_laplace_nll"
+            self.options.prior_loss_weight = 1
+            self.options.prior_loss_bandwidth = 0.1
 
         # Disable multi-threaded data loading in case we have to predict depth maps in the dataset class.
         if self.use_depth and self.options.depth_files is None:
@@ -104,7 +118,10 @@ class TrainerACE:
             ace_pose_file_conf_threshold=self.options.ace_pose_file_conf_threshold,
             pose_seed=self.options.use_pose_seed,
             depth_files=self.options.depth_files,
+            calibration_files=self.options.calibration_files,
+            calibration_file_f_idx=self.options.calibration_file_f_idx,
             use_depth=self.use_depth,
+            return_eye_coords=return_eye_coords,
             augment=self.options.use_aug,
             aug_rotation=self.options.aug_rotation,
             aug_scale_max=self.options.aug_scale,
@@ -158,12 +175,40 @@ class TrainerACE:
         self.iterations_output = self.options.iterations_output
 
         # Setup reprojection loss function.
-        self.repro_loss = ReproLoss(
+        repro_loss = ReproLoss(
             total_iterations=self.options.iterations,
             soft_clamp=self.options.repro_loss_soft_clamp,
             soft_clamp_min=self.options.repro_loss_soft_clamp_min,
             type=self.options.repro_loss_type,
             circle_schedule=(self.options.repro_loss_schedule == 'circle')
+        )
+
+        # Setup prior loss function. Used with "probabilistic" loss structure or "dsac*" with diffusion prior
+        prior_loss = PriorLoss(
+            prior_loss_type=self.options.prior_loss_type,
+            prior_loss_bandwidth=self.options.prior_loss_bandwidth,
+            prior_loss_location=self.options.prior_loss_location,
+            prior_diffusion_model_path=self.options.prior_diffusion_model_path,
+            device=self.device,
+            prior_diffusion_start_step=self.options.prior_diffusion_start_step,
+            prior_diffusion_warmup_steps=self.options.prior_diffusion_warmup_steps,
+            prior_diffusion_subsample=self.options.prior_diffusion_subsample
+        )
+
+        # Setup overall loss function which combines the reprojection error with:
+        # - DSAC*-style regularization (optionally with diffusion prior) for "dsac*" loss structure
+        # - Prior loss for "probabilistic" loss structure
+        self.ace_loss = AceLoss(
+            loss_structure=self.options.loss_structure,
+            repro_loss=repro_loss,
+            prior_loss=prior_loss,
+            prior_loss_weight=self.options.prior_loss_weight,
+            use_depth=self.use_depth,
+            depth_min=self.options.depth_min,
+            depth_max=self.options.depth_max,
+            repro_loss_hard_clamp=self.options.repro_loss_hard_clamp,
+            learning_rate_cooldown_trigger_px_threshold=self.options.learning_rate_cooldown_trigger_px_threshold,
+            depth_target=self.options.depth_target,
         )
 
         # Will be filled at the beginning of the training process.
@@ -195,7 +240,8 @@ class TrainerACE:
                 self.options.render_map_depth_filter,
                 mapping_vis_error_threshold=self.options.render_map_error_threshold,
                 mapping_state_file_name=state_file,
-                marker_size=self.options.render_marker_size)
+                marker_size=self.options.render_marker_size,
+                render_depth_hist=self.options.render_depth_hist,)
         else:
             self.ace_visualizer = None
 
@@ -266,6 +312,8 @@ class TrainerACE:
                 ace_pose_file=self.options.use_ace_pose_file,
                 ace_pose_file_conf_threshold=self.options.ace_pose_file_conf_threshold,
                 pose_seed=self.options.use_pose_seed,
+                calibration_files=self.options.calibration_files,
+                calibration_file_f_idx=self.options.calibration_file_f_idx,
                 augment=False,
                 image_short_size=self.options.image_resolution,
                 use_half=self.options.use_half,
@@ -509,7 +557,6 @@ class TrainerACE:
         if self.iteration >= self.training_scheduler.max_iterations:
             return
 
-        batch_size = features_bC.shape[0]
         channels = features_bC.shape[1]
 
         # Reshape to a "fake" BCHW shape, since it's faster to run through the network compared to the original shape.
@@ -540,8 +587,6 @@ class TrainerACE:
             pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
 
         # Avoid division by zero.
-        # Note: negative values are also clamped at +self.options.depth_min. The predicted pixel would be wrong,
-        # but that's fine since we mask them out later.
         pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
 
         # Dehomogenise.
@@ -551,66 +596,16 @@ class TrainerACE:
         reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
         reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
 
-        #
-        # Compute masks used to ignore invalid pixels.
-        #
-        # Predicted coordinates behind or close to camera plane.
-        invalid_min_depth_b1 = pred_cam_coords_b31[:, 2] < self.options.depth_min
-        # Very large reprojection errors.
-        invalid_repro_b1 = reprojection_error_b1 > self.options.repro_loss_hard_clamp
-        # Predicted coordinates beyond max distance.
-        invalid_max_depth_b1 = pred_cam_coords_b31[:, 2] > self.options.depth_max
-
-        # Invalid mask is the union of all these. Valid mask is the opposite.
-        invalid_mask_b1 = (invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1)
-
-        if self.use_depth:
-            # if GT scene coordinates are available, also check whether predictions are already sufficiently close
-            invalid_target_crds_b1 = (
-                        torch.linalg.norm(target_crds_b3 - pred_scene_coords_b31.squeeze(), dim=1) > 0.1).unsqueeze(1)
-            # in the previous mask, ignore pixels without GT scene coordinates (all zeros)
-            target_crds_available_b1 = (target_crds_b3.abs().sum(dim=1) > 0.00001).unsqueeze(1)
-
-            invalid_mask_b1 = invalid_mask_b1 | (invalid_target_crds_b1 & target_crds_available_b1)
-
-        valid_mask_b1 = ~invalid_mask_b1
-
-        if valid_mask_b1.sum() > 0:
-            # Reprojection error for all valid scene coordinates.
-            valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
-
-            # Compute the loss for valid predictions.
-            loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, self.iteration)
-
-            batch_inliers = valid_reprojection_error_b1 < self.options.learning_rate_cooldown_trigger_px_threshold
-            batch_inliers = float(batch_inliers.sum()) / batch_size
-        else:
-            loss_valid = 0
-            batch_inliers = 0
-
-        # Handle the invalid predictions
-        if not self.use_depth:
-            # generate proxy coordinate targets with constant depth assumption.
-            pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
-            target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
-
-            # Compute the distance to target camera coordinates.
-            invalid_mask_b11 = invalid_mask_b1.unsqueeze(2)
-            loss_invalid = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31).masked_select(
-                invalid_mask_b11).sum()
-        else:
-            if invalid_mask_b1.sum() > 0:
-                # ignore pixels without GT scene coordinates (all zeros)
-                invalid_mask_b1 = invalid_mask_b1 & target_crds_available_b1
-
-                loss_invalid = torch.linalg.norm(target_crds_b3 - pred_scene_coords_b31.squeeze(), dim=1)
-                loss_invalid = loss_invalid[invalid_mask_b1.squeeze()].sum()
-            else:
-                loss_invalid = 0
-
-        # Final loss is the sum of all 2.
-        loss = loss_valid + loss_invalid
-        loss /= batch_size
+        batch_inliers, loss = self.ace_loss.compute(
+            pred_cam_coords_b31=pred_cam_coords_b31,
+            pred_scene_coords_b31=pred_scene_coords_b31,
+            reprojection_error_b1=reprojection_error_b1,
+            target_crds_b3=target_crds_b3,
+            target_px_b2=target_px_b2,
+            invKs_b33=invKs_b33,
+            iteration=self.iteration,
+            max_iterations=self.training_scheduler.max_iterations
+        )
 
         if torch.any(torch.isnan(loss)):
             _logger.error("Aborting because of NaN loss")
@@ -674,8 +669,10 @@ class TrainerACE:
 
             if self.ace_visualizer is not None:
                 vis_scene_coords = pred_scene_coords_b31.detach().cpu().squeeze().numpy()
+                vis_depth = pred_cam_coords_b31[:, 2].detach().cpu().squeeze().numpy()
                 vis_errors = reprojection_error_b1.detach().cpu().squeeze().numpy()
-                self.ace_visualizer.render_mapping_frame(vis_scene_coords, vis_errors, poses_updated, poses_original,
+                self.ace_visualizer.render_mapping_frame(vis_scene_coords, vis_errors, vis_depth,
+                                                         poses_updated, poses_original,
                                                          self.iteration)
 
     def save_model(self):

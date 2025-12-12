@@ -61,7 +61,8 @@ class ACEVisualizer:
                  sweep_vis_iterations_threshold=10,
                  confidence_threshold=1000,
                  mapping_state_file_name='mapping_state.pkl',
-                 marker_size=0.03):
+                 marker_size=0.03,
+                 render_depth_hist=False,):
         """
         Constructor. Sets standard values for visualisation parameters.
 
@@ -74,6 +75,7 @@ class ACEVisualizer:
         @param confidence_threshold: threshold for regarding a pose as successfully registered
         @param mapping_state_file_name: file name for storing and reading the visualiser state
         @param marker_size: size of the camera frustum markers
+        @param render_depth_hist: whether to render depth histogram during mapping iterations
         """
         self.target_path = target_path
         # buffer file for smooth rendering across training and test script calls
@@ -104,6 +106,13 @@ class ACEVisualizer:
         self.err_hist_w_reloc = int(0.6 * reference_height)
         self.err_hist_w_mapping = int(0.2 * reference_height)
 
+        self.depth_hist_render = render_depth_hist
+        self.depth_hist_max_range = 5 # meters
+        self.depth_hist_x = int(0.35 * reference_height)
+        self.depth_hist_y = int(1.35 * reference_height)
+        self.depth_hist_h = int(0.4 * reference_height)
+        self.depth_hist_w = int(0.2 * reference_height)
+
         # mapping vis parameters
         self.framecount_transition = 10  # frame count for growing the fully trained map at the end of mapping
         self.mapping_done_idx = -1  # frame idx when mapping was finalized, -1 when not finalized yet
@@ -119,6 +128,9 @@ class ACEVisualizer:
 
         # color map for camera position change during refinement
         self.pose_color_map = plt.cm.get_cmap("plasma")(np.linspace(0, 1, 256))[:, :3]
+
+        # color map for mapping depth
+        self.depth_color_map = plt.cm.get_cmap("viridis")(np.linspace(0, 1, 256))[:, :3]
 
         # reloc vis parameters
         # scale factor for the camera frustum objects
@@ -503,6 +515,36 @@ class ACEVisualizer:
             rr, cc = draw.rectangle((hist_x, bar_y), extent=(bar_w, bar_h))
             image[rr, cc, 0:3] = hist_colors[hist_idx]
 
+    def _draw_depth_hist(self, image, depth):
+        """
+        Draw histogram of mapping depth values.
+
+        @param image: Input frame.
+        @param errors: 1D array of scalar depth values.
+        @return: Frame with histogram.
+        """
+        # clip to max range
+        depth = depth.clip(0, self.depth_hist_max_range)
+
+        # generate histogram of depth values
+        hist_values, _ = np.histogram(depth, bins=self.err_hist_bins, range=(0, self.depth_hist_max_range))
+
+        # look up colors for bins
+        hist_color_idxs = [int(hist_idx / self.err_hist_bins * 255) for hist_idx in range(self.err_hist_bins)]
+        hist_colors = [self.depth_color_map[clr_idx] * 255 for clr_idx in hist_color_idxs]
+
+        self._draw_hist(
+            image=image,
+            hist_values=hist_values,
+            hist_colors=hist_colors,
+            hist_x=self.depth_hist_x,
+            hist_y=self.depth_hist_y,
+            hist_h=self.depth_hist_h,
+            hist_w=self.depth_hist_w,
+            hist_max=max(hist_values.max(), 0.00001))
+
+        return image
+
     def _draw_repro_error_hist(self, image, errors):
         """
         Draw histogram of mapping reprojection errors.
@@ -651,6 +693,12 @@ class ACEVisualizer:
             # yep, I use spaces to align parts of this caption. Too lazy to do it properly :)
         ]
 
+        if self.depth_hist_render:
+            captions_dict.append(
+            {'x': 0.76, 'y': 0.68, 'fs': 0.015 * image_h,
+             'text': f"0m                   Depth                  >{self.depth_hist_max_range}m"},
+            )
+
         return self._write_captions(image, captions_dict)
 
     def _write_reloc_captions(self, image):
@@ -674,11 +722,14 @@ class ACEVisualizer:
 
         return self._write_captions(image, captions_dict)
 
-    def _write_sweep_captions(self, image, frames_registered, frames_total):
+    def _write_sweep_captions(self, image, frames_registered, frames_total, depth_hist=False):
         """
         Write all image captions for the final camera sweep.
 
         @param image: Input frame.
+        @param frames_registered: Number of frames registered.
+        @param frames_total: Number of frames total.
+        @param depth_hist: If true, write caption for depth histogram.
         @return: Frame with captions.
         """
         image_h = image.shape[0]
@@ -692,6 +743,12 @@ class ACEVisualizer:
              'text': f"0          Registered in Iteration        >{self.sweep_vis_iterations_threshold}"}
             # yep, I use spaces to align parts of this caption. Too lazy to do it properly :)
         ]
+
+        if depth_hist:
+            captions_dict.append(
+            {'x': 0.76, 'y': 0.68, 'fs': 0.015 * image_h,
+             'text': f"0m                   Depth                  >{self.depth_hist_max_range}m"},
+            )
 
         return self._write_captions(image, captions_dict)
 
@@ -729,7 +786,7 @@ class ACEVisualizer:
         r = pyrender.OffscreenRenderer(self.render_width, self.render_height, point_size=self.point_size)
 
         # cast PC to rendering object
-        frame_xyz, frame_clr, _ = self.point_cloud_buffer.get_point_cloud()
+        frame_xyz, frame_clr, _, _ = self.point_cloud_buffer.get_point_cloud()
         ace_map = pyrender.Mesh.from_points(frame_xyz, colors=frame_clr)
 
         # get camera trajectory mesh
@@ -770,9 +827,11 @@ class ACEVisualizer:
 
         if current_frame is not None:
             # draw loading bar, captions and reprojection error histogram
-            _, _, frame_errs = self.point_cloud_buffer.get_point_cloud()
+            _, _, frame_errs, frame_depth = self.point_cloud_buffer.get_point_cloud()
             # current_frame = self._draw_loading_bar(current_frame)
             current_frame = self._draw_repro_error_hist(current_frame, frame_errs)
+            if self.depth_hist_render:
+                current_frame = self._draw_depth_hist(current_frame, frame_depth)
             current_frame = self._write_mapping_captions(current_frame)
 
             # write to disk
@@ -818,7 +877,13 @@ class ACEVisualizer:
                 frustum_maker=True
             )
 
-    def render_mapping_frame(self, scene_coordinates, errors, pose_buffer, pose_buffer_orig, iteration):
+    def render_mapping_frame(self,
+                             scene_coordinates,
+                             errors,
+                             depth,
+                             pose_buffer,
+                             pose_buffer_orig,
+                             iteration):
         """
         Update point cloud buffer with current scene coordinates and render frame.
 
@@ -826,6 +891,7 @@ class ACEVisualizer:
 
         @param scene_coordinates: N3 array of points in OpenCV convention.
         @param errors: N1 array of scalar reprojection errors for coloring the point cloud.
+        @param depth: N1 array of scalar depth values for histogram.
         @param pose_buffer: Buffer of refined camera poses, Nx3x4.
         @param pose_buffer_orig: Buffer of original camera poses, Nx3x4.
         @param iteration: Current iteration of the mapping process
@@ -838,7 +904,7 @@ class ACEVisualizer:
         # color point cloud according to errors
         scene_coordinates_clr, errors_normalized = self._errors_to_colors(errors, self.mapping_vis_error_threshold)
         # update rolling buffer
-        self.point_cloud_buffer.update_buffer(scene_coordinates, scene_coordinates_clr, errors_normalized)
+        self.point_cloud_buffer.update_buffer(scene_coordinates, scene_coordinates_clr, errors_normalized, depth)
 
         # remember how many items were in the buffer before we add the current camera poses
         trajectory_buffer_size = len(self.trajectory_buffer.trajectory)
@@ -909,6 +975,10 @@ class ACEVisualizer:
             'camera_buffer': self.scene_camera.get_camera_buffer(),
             'pan_cameras': self.pan_cams
         }
+
+        if self.depth_hist_render:
+            # also store last depth values in state dict for showing in final sweep
+            _, _, _, state_dict['map_depth'] = self.point_cloud_buffer.get_point_cloud()
 
         with open(self.state_file, "wb") as file:
             pickle.dump(state_dict, file)
@@ -1035,6 +1105,7 @@ class ACEVisualizer:
 
         map_xyz = state_dict['map_xyz']
         map_clr = state_dict['map_clr']
+        map_depth = state_dict.get('map_depth', None)
 
         _logger.info("Generating final camera sweep.")
 
@@ -1085,7 +1156,9 @@ class ACEVisualizer:
             if current_frame is not None:
                 # finalize frame
                 current_frame = self._draw_reg_iteration_hist(current_frame, self.reloc_conf_buffer)
-                current_frame = self._write_sweep_captions(current_frame, len(poses), total_poses)
+                if map_depth is not None:
+                    current_frame = self._draw_depth_hist(current_frame, map_depth)
+                current_frame = self._write_sweep_captions(current_frame, len(poses), total_poses, depth_hist=(map_depth is not None))
 
                 self._save_frame(current_frame)
 

@@ -6,7 +6,6 @@ import numpy as np
 import logging
 
 _logger = logging.getLogger(__name__)
-_logger.setLevel(logging.DEBUG)
 
 TestEstimate = namedtuple("TestEstimate", [
     "pose_est",
@@ -49,7 +48,7 @@ def print_hyp(hypothesis, hyp_name):
     h_translation = np.linalg.norm(hypothesis['transformation'][:3, 3])
     h_angle = np.linalg.norm(Rotation.from_matrix(hypothesis['transformation'][:3, :3]).as_rotvec()) * 180 / math.pi
     _logger.debug(f"{hyp_name}: score={hypothesis['score']}, translation={h_translation:.2f}m, "
-                 f"rotation={h_angle:.1f}deg.")
+                  f"rotation={h_angle:.1f}deg.")
 
 
 def get_inliers(h_T, poses_gt, poses_est, inlier_threshold_t, inlier_threshold_r):
@@ -68,9 +67,37 @@ def get_inliers(h_T, poses_gt, poses_est, inlier_threshold_t, inlier_threshold_r
     # intersection of both
     return np.logical_and(inliers_r, inliers_t)
 
-def estimate_alignment(estimates,
+
+def _filter_and_extract_poses(estimates, confidence_threshold, min_confident_estimates):
+    """
+    Filters estimates by confidence and validity, then extracts poses into NumPy arrays.
+    """
+    # Filter out estimates with invalid ground truth poses (inf or nan)
+    valid_estimates = [
+        e for e in estimates if not np.any(np.isinf(e.pose_gt) | np.isnan(e.pose_gt))
+    ]
+    # Filter by confidence threshold
+    confident_estimates = [
+        e for e in valid_estimates if e.confidence > confidence_threshold
+    ]
+    num_confident_estimates = len(confident_estimates)
+    _logger.debug(f"{num_confident_estimates} estimates considered confident.")
+
+    # Check if we have enough estimates to proceed
+    if num_confident_estimates < min_confident_estimates:
+        _logger.debug(f"Too few confident estimates. Aborting alignment.")
+        return None, None
+
+    # Gather estimated and ground truth poses into NumPy arrays
+    poses_est = np.array([e.pose_est for e in confident_estimates])
+    poses_gt = np.array([e.pose_gt for e in confident_estimates])
+
+    return poses_gt, poses_est
+
+
+def estimate_alignment_ransac(estimates,
                        confidence_threshold,
-                       min_cofident_estimates=10,
+                       min_confident_estimates=10,
                        inlier_threshold_t=0.05,
                        inlier_threshold_r=5,
                        ransac_iterations=10000,
@@ -78,25 +105,18 @@ def estimate_alignment(estimates,
                        refinement_max_it=8,
                        estimate_scale=False
                        ):
-    _logger.debug("Estimate transformation between pose estimates and ground truth.")
+    _logger.debug("Estimate transformation with RANSAC.")
 
-    # Filter estimates using confidence threshold
-    valid_estimates = [estimate for estimate in estimates if ((not np.any(np.isinf(estimate.pose_gt))) and (not np.any(np.isnan(estimate.pose_gt))))]
-    confident_estimates = [estimate for estimate in valid_estimates if estimate.confidence > confidence_threshold]
-    num_confident_estimates = len(confident_estimates)
+    # filter and extract poses
+    poses_gt, poses_est = _filter_and_extract_poses(
+        estimates, confidence_threshold, min_confident_estimates
+    )
 
-    _logger.debug(f"{num_confident_estimates} estimates considered confident.")
-
-    if num_confident_estimates < min_cofident_estimates:
-        _logger.debug(f"Too few confident estimates. Aborting alignment.")
+    # abort if data preparation failed
+    if poses_gt is None:
         return None, 1
 
-    # gather estimated and ground truth poses
-    poses_est = np.ndarray((num_confident_estimates, 4, 4))
-    poses_gt = np.ndarray((num_confident_estimates, 4, 4))
-    for i, estimate in enumerate(confident_estimates):
-        poses_est[i] = estimate.pose_est
-        poses_gt[i] = estimate.pose_gt
+    num_confident_estimates = poses_gt.shape[0]
 
     # start robust RANSAC loop
     ransac_hypotheses = []
@@ -168,13 +188,77 @@ def estimate_alignment(estimates,
 
             else:
                 _logger.debug(f"Stopping refinement. Score did not improve: New score={refined_score}, "
-                             f"Old score={ref_hyp['score']}")
+                              f"Old score={ref_hyp['score']}")
                 break
 
-    # re-sort refined hyotheses
+    # re-sort refined hypotheses
     ransac_hypotheses = sorted(ransac_hypotheses, key=lambda x: x['score'], reverse=True)
 
     for hyp_idx, hyp in enumerate(ransac_hypotheses):
         print_hyp(hyp, f"Hypothesis {hyp_idx}")
 
     return ransac_hypotheses[0]['transformation'], ransac_hypotheses[0]['scale']
+
+
+def estimate_alignment_least_squares(estimates,
+                                     confidence_threshold,
+                                     min_confident_estimates=10,
+                                     estimate_scale=False):
+    _logger.debug("Estimate transformation with least squares.")
+
+    # filter and extract poses
+    poses_gt, poses_est = _filter_and_extract_poses(
+        estimates, confidence_threshold, min_confident_estimates
+    )
+
+    # abort if data preparation failed
+    if poses_gt is None:
+        return None, 1
+
+    # compute alignment using all confident points
+    h_pts1 = poses_gt[:, :3, 3]
+    h_pts2 = poses_est[:, :3, 3]
+    h_T, h_scale = kabsch(h_pts1, h_pts2, estimate_scale)
+
+    return h_T, h_scale
+
+
+def compute_RPE(poses_a, poses_b):
+    """Compute the relative pose error (RPE)
+    Args:
+        poses_a: a list of poses, shape Nx4x4
+        poses_b: a list of corresponding poses, shape Nx4x4
+    """
+    errs_trans = []
+
+    for i in range(len(poses_a) - 1):
+        # calculate delta pose between current pose and next pose
+        pose_a_delta = np.linalg.inv(poses_a[i]) @ poses_a[i+1]
+        pose_b_delta = np.linalg.inv(poses_b[i]) @ poses_b[i+1]
+
+        # compare delta poses
+        pose_delta = np.linalg.inv(pose_a_delta) @ pose_b_delta
+
+        # relative error is the length of the translation of the delta
+        errs_trans.append(np.linalg.norm(pose_delta[:3, 3]))
+
+    # return mean error
+    return sum(errs_trans) / len(errs_trans)
+
+def compute_ATE(poses_a, poses_b):
+    """Compute the absolute trajectory error (ATE)
+    Args:
+        poses_a: a list of poses, shape Nx4x4
+        poses_b: a list of corresponding poses, shape Nx4x4
+    """
+
+    # select translation component of poses
+    trans_a = poses_a[:, :3, 3]
+    trans_b = poses_b[:, :3, 3]
+
+    # distances between camera centers
+    errs_trans = np.linalg.norm(trans_a - trans_b, axis=1)
+    # RMSE of distances
+    rmse = np.linalg.norm(errs_trans) / np.sqrt(len(errs_trans))
+
+    return rmse

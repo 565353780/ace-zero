@@ -32,7 +32,10 @@ class CamLocDataset(Dataset):
                  ace_pose_file_conf_threshold=None,
                  pose_seed=-1,
                  depth_files=None,
+                 calibration_files=None,
+                 calibration_file_f_idx=0,
                  use_depth=False,
+                 return_eye_coords=False,
                  augment=False,
                  aug_rotation=15,
                  aug_scale_min=2 / 3,
@@ -52,7 +55,10 @@ class CamLocDataset(Dataset):
             ace_pose_file_conf_threshold: Confidence threshold for ACE pose file. Ignore images below confidence.
             pose_seed: If set, only use a single image from the dataset. Float in [0, 1] that determines the image relative to the dataset size.
             depth_files: Glob pattern that matches depth files associated with rgb files.
-            use_depth: Use depth to generate ground truth scene coordinates. Either from depth files or ZoeDepth.
+            calibration_files: Glob pattern that matches calibration files associated with rgb files. Used to populate focal_lengths list.
+            calibration_file_f_idx: Index of the item in each calibration file to be interpreted as focal length.
+            use_depth: Use depth to generate target coordinates. Either from depth files or ZoeDepth.
+            return_eye_coords: If True, target coordinates returned are eye (camera) coordinates, otherwise scene coordinates.
             augment: Use random data augmentation, note: not supported for mode = 2 (RGB-D) since pre-generated eye
                 coordinates cannot be augmented
             aug_rotation: Max 2D image rotation angle, sampled uniformly around 0, both directions, degrees.
@@ -68,6 +74,7 @@ class CamLocDataset(Dataset):
 
         self.use_half = use_half
         self.use_depth = use_depth
+        self.return_eye_coords = return_eye_coords
 
         self.image_short_size = image_short_size
 
@@ -91,21 +98,49 @@ class CamLocDataset(Dataset):
             dataset_info = dataset_io.load_dataset_ace(
                 pose_file=ace_pose_file, confidence_threshold=ace_pose_file_conf_threshold)
 
-            self.rgb_files, self.poses, self.focal_lengths = dataset_info
+            self.rgb_files, self.poses, self.focal_lengths, files_kept = dataset_info
         else:
             _logger.info(f"Loading RGB files from: {rgb_files}")
             self.rgb_files = dataset_io.get_files_from_glob(rgb_files)
             self.poses = dataset_io.load_pose_files(pose_files) if pose_files is not None else []
 
-            if len(self.poses) > 0:
-                # Remove invalid poses and corresponding RGB files.
-                self.rgb_files, self.poses = dataset_io.remove_invalid_poses(self.rgb_files, self.poses)
+            # Remove invalid poses and corresponding RGB files.
+            self.rgb_files, self.poses, files_kept = dataset_io.remove_invalid_poses(self.rgb_files, self.poses)
 
             # Focal length can be set via an extra function call, or heuristic will be used
             self.focal_lengths = []
 
         # Load depth files if available.
-        self.depth_files = dataset_io.get_files_from_glob(depth_files) if depth_files is not None else []
+        if depth_files is not None:
+            self.depth_files = dataset_io.get_files_from_glob(depth_files)
+            # check if files have been removed and remove depth files as well to keep them in sync
+            self.depth_files = [df for df, keep in zip(self.depth_files, files_kept) if keep]
+            # final check to make sure depth and rgb files are in sync
+            assert len(self.depth_files) == len(self.rgb_files)
+        else:
+            self.depth_files = []
+
+        # Load calibration files if available and extract focal lengths.
+        if calibration_files is not None:
+            calibration_files_list = dataset_io.get_files_from_glob(calibration_files)
+            # check if files have been removed and remove calibration files as well to keep them in sync
+            calibration_files_list = [cf for cf, keep in zip(calibration_files_list, files_kept) if keep]
+            # final check to make sure calibration and rgb files are in sync
+            assert len(calibration_files_list) == len(self.rgb_files)
+            
+            # Extract focal lengths from calibration files
+            for calibration_file in calibration_files_list:
+                with open(calibration_file, 'r') as f:
+                    content = f.read()
+                    # Split by spaces and newlines to get all items
+                    items = content.split()
+                    # Extract the nth item as focal length
+                    if calibration_file_f_idx < len(items):
+                        focal_length = float(items[calibration_file_f_idx])
+                        self.focal_lengths.append(focal_length)
+                    else:
+                        raise ValueError(f"Calibration file {calibration_file} has only {len(items)} items, "
+                                       f"but index {calibration_file_f_idx} was requested.")
 
         # Reduce dataset to single image if pose_seed is set.
         if pose_seed > -1:
@@ -251,10 +286,11 @@ class CamLocDataset(Dataset):
     def get_focal_length(self, idx):
         """
         This method is used to get the focal length of the camera used to capture the image at the given index.
-        The focal length can be obtained in three ways:
+        The focal length can be obtained in four ways (in order of priority):
         1. If an external focal length is set, it is used.
-        2. If the heuristic focal length is enabled, it is calculated based on the image dimensions.
-        3. Otherwise, the focal length is taken from pre-loaded calibration files or the pose file.
+        2. If focal lengths are available from calibration files or pose files, they are used.
+        3. If the heuristic focal length is enabled, it is calculated based on the image dimensions.
+        4. Otherwise, error (should not happen with proper validation).
 
         Parameters:
         idx (int): The index of the image for which the focal length is to be obtained.
@@ -266,6 +302,9 @@ class CamLocDataset(Dataset):
         if self.external_focal_length is not None:
             # use external focal length if set
             return self.external_focal_length
+        elif len(self.focal_lengths) > 0:
+            # use focal lengths from calibration files or pose files if available
+            return self.focal_lengths[idx]
         elif self.use_heuristic_focal_length:
             # use heuristic focal length derived from image dimensions
             width, height = self.get_image_size(idx)
@@ -273,7 +312,7 @@ class CamLocDataset(Dataset):
             # we use 70% of the diagonal as focal length
             return math.sqrt(width ** 2 + height ** 2) * 0.7
         else:
-            return self.focal_lengths[idx]
+            raise ValueError("No focal length source available. This should not happen with proper validation.")
 
     def _get_single_item(self, idx, image_short_size):
         # Apply index indirection.
@@ -377,9 +416,13 @@ class CamLocDataset(Dataset):
             eye[2] = depth
             eye[3] = 1
 
-            # eye to scene coordinates
-            sc = np.matmul(pose.numpy() @ pose_rot.numpy(), eye.reshape(4, -1))
-            sc = sc.reshape(4, depth.shape[0], depth.shape[1])
+            if self.return_eye_coords:
+                # target coordinates are eye coordinates, do nothing
+                sc = eye
+            else:
+                # target coordinates are scene coordinates, transform eye coordinates
+                sc = np.matmul(pose.numpy() @ pose_rot.numpy(), eye.reshape(4, -1))
+                sc = sc.reshape(4, depth.shape[0], depth.shape[1])
 
             # mind pixels with invalid depth
             sc[:, depth == 0] = 0
