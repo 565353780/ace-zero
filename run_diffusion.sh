@@ -6,5 +6,4 @@ python ace_zero.py \
   --loss_structure "dsac*" \
   --prior_loss_type diffusion \
   --prior_loss_weight 200 \
-  --prior_diffusion_model_path /home/lichanghao/chLi/Model/ACE0/diffusion_prior.pt \
-  --render_visualization True
+  --prior_diffusion_model_path /home/lichanghao/chLi/Model/ACE0/diffusion_prior.pt
